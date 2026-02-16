@@ -2,7 +2,7 @@
   {
     "modid": "${modid}",
     "name": "${name}",
-    "description": "Allows players (or all entities) to pass through leaf blocks. Optional slowdown and rustle sounds while moving through leaves.",
+    "description": "Allows players (or all entities) to pass through leaf blocks. Now plays rustle sounds when moving through and has an optional slowdown along with blocking total submersion in the leaves.,
     "version": "${version}",
     "mcversion": "${mcversion}",
     "url": "https://discord.wargames.uk",
