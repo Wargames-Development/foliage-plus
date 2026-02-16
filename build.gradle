@@ -31,6 +31,10 @@ def modInfo = [
 minecraft {
     version = "${mcVersion}-10.13.4.1614-1.7.10"
     runDir = "eclipse"
+
+    // Replace @VERSION@ inside our @Mod class at build time
+    replace "@VERSION@", project.version
+    replaceIn "com/wdg/foliageplus/FoliagePlusMod.java"
 }
 
 repositories {
@@ -105,6 +109,26 @@ jar {
     baseName = "${jarBaseName}-${fullVersion}${suffix}"
     version = null // prevents double versioning like -1.8.3_X83
     destinationDir = file("build/libs")
+
+    // Required for 1.7.10 coremods (ASM transformers) to load
+    manifest {
+        attributes(
+                "FMLCorePlugin": "com.wdg.foliageplus.core.FoliagePlusCoreMod",
+                "FMLCorePluginContainsFMLMod": "true"
+        )
+    }
 }
 
 build.dependsOn incrementBuildVersion
+
+// Ensure the reobf task runs when building the jar.
+// Different ForgeGradle setups expose either 'reobfJar' or 'reobf'.
+afterEvaluate {
+    if (tasks.findByName("reobfJar") != null) {
+        build.dependsOn "reobfJar"
+    } else if (tasks.findByName("reobf") != null) {
+        build.dependsOn "reobf"
+    } else {
+        println "[FoliagePlus] Warning: No reobf task found (reobfJar/reobf). Build will produce a -dev jar only."
+    }
+}
