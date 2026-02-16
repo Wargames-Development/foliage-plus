@@ -10,7 +10,7 @@ public final class FoliagePlusHooks {
 
     private FoliagePlusHooks() {}
 
-    // Snapshot values used by the coremod hook (safe defaults)
+    // Snapshot values used by the ASM hook (safe defaults)
     private static volatile boolean enabled = true;
     private static volatile boolean allowFullCover = true;
     private static volatile boolean affectAllEntities = false;
@@ -45,14 +45,17 @@ public final class FoliagePlusHooks {
             return false;
         }
 
+        // allowFullCover=false behavior:
+        // If a leaf block has another leaf block directly above it, the LOWER one becomes solid again.
+        // This prevents being "fully inside" a 2-high bush while still allowing walking through top leaves.
         if (!allowFullCover && (entity instanceof EntityPlayer)) {
-            // If the player's feet and head are both within leaf blocks, do NOT allow them to be fully covered.
-            if (isFullyCoveredByLeaves(entity, world)) {
-                return false;
+            Block above = world.getBlock(x, y + 1, z);
+            if (above != null && above.isLeaves(world, x, y + 1, z)) {
+                return false; // bottom of a leaf column: keep collision
             }
         }
 
-        return true;
+        return true; // leaf is pass-through
     }
 
     public static boolean isEntityInLeaves(Entity entity, World world) {
@@ -72,27 +75,6 @@ public final class FoliagePlusHooks {
         boolean inFeet = (feet != null) && feet.isLeaves(world, x, yFeet, z);
         boolean inHead = (head != null) && head.isLeaves(world, x, yHead, z);
 
-        if (!allowFullCover && (inFeet && inHead) && (entity instanceof EntityPlayer)) {
-            // When full-cover is disallowed, treat this as not-in-leaves for slowdown/sound purposes.
-            return false;
-        }
-
         return inFeet || inHead;
-    }
-
-    private static boolean isFullyCoveredByLeaves(Entity entity, World world) {
-        int x = MathHelper.floor_double(entity.posX);
-        int z = MathHelper.floor_double(entity.posZ);
-
-        int yFeet = MathHelper.floor_double(entity.boundingBox.minY + 0.01D);
-        int yHead = yFeet + 1;
-
-        Block feet = world.getBlock(x, yFeet, z);
-        Block head = world.getBlock(x, yHead, z);
-
-        boolean inFeet = (feet != null) && feet.isLeaves(world, x, yFeet, z);
-        boolean inHead = (head != null) && head.isLeaves(world, x, yHead, z);
-
-        return inFeet && inHead;
     }
 }

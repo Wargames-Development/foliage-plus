@@ -1,0 +1,13 @@
+{
+  "rustle": {
+    "category": "player",
+    "sounds": [
+      "footsteps/rustle1",
+      "footsteps/rustle2",
+      "footsteps/rustle3",
+      "footsteps/rustle4",
+      "footsteps/rustle5",
+      "footsteps/rustle6"
+    ]
+  }
+}

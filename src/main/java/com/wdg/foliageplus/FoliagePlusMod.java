@@ -2,11 +2,11 @@ package com.wdg.foliageplus;
 
 import com.wdg.foliageplus.core.FoliagePlusConfig;
 import com.wdg.foliageplus.core.FoliagePlusHooks;
+import cpw.mods.fml.common.FMLCommonHandler;
 import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.Mod.EventHandler;
 import cpw.mods.fml.common.event.FMLInitializationEvent;
 import cpw.mods.fml.common.event.FMLPreInitializationEvent;
-import cpw.mods.fml.common.FMLCommonHandler;
 import net.minecraftforge.common.MinecraftForge;
 
 @Mod(
@@ -32,8 +32,11 @@ public class FoliagePlusMod {
 
     @EventHandler
     public void init(FMLInitializationEvent event) {
-        // Tick events (one instance only)
+        // One handler instance on both buses:
+        // - FML bus: player tick (sound)
+        // - Forge bus: living update (slowdown)
         FoliagePlusTickHandler handler = new FoliagePlusTickHandler();
         FMLCommonHandler.instance().bus().register(handler);
+        MinecraftForge.EVENT_BUS.register(handler);
     }
 }
