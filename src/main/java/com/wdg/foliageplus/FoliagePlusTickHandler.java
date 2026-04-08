@@ -21,17 +21,14 @@ public class FoliagePlusTickHandler {
     private static final UUID SPEED_MOD_UUID = UUID.fromString("b6a1e51f-6b44-4b5f-b97f-0a6a56c63571");
     private static final String SPEED_MOD_NAME = "FoliagePlusSlow";
 
+    private static final double SPEED_SMOOTH_STEP = 0.06D;
+
     private final Map<UUID, Integer> clientSoundCooldown = new HashMap<UUID, Integer>();
+    private final Map<UUID, Double> currentSpeedMultipliers = new HashMap<UUID, Double>();
 
     @SubscribeEvent
     public void onLivingUpdate(LivingEvent.LivingUpdateEvent event) {
         if (event.entityLiving == null) {
-            return;
-        }
-
-        if (!FoliagePlusConfig.enabled) {
-            // If disabled, make sure we remove any leftover speed modifiers
-            removeSpeedModifier(event.entityLiving);
             return;
         }
 
@@ -41,29 +38,33 @@ public class FoliagePlusTickHandler {
             return;
         }
 
+        if (!FoliagePlusConfig.enabled) {
+            updateSpeedModifierSmooth(living, 1.0D);
+            return;
+        }
+
         boolean isPlayer = (living instanceof EntityPlayer);
 
         if (!FoliagePlusConfig.affectAllEntities && !isPlayer) {
-            // Players-only mode: don't affect mobs
-            removeSpeedModifier(living);
+            updateSpeedModifierSmooth(living, 1.0D);
             return;
         }
 
         if (isPlayer) {
             EntityPlayer player = (EntityPlayer) living;
             if (player.capabilities.isFlying) {
-                removeSpeedModifier(living);
+                updateSpeedModifierSmooth(living, 1.0D);
                 return;
             }
         }
 
-        boolean inLeaves = FoliagePlusHooks.isEntityInLeaves(living, world);
-        if (!inLeaves) {
-            removeSpeedModifier(living);
-            return;
+        double targetMultiplier = 1.0D;
+
+        if (FoliagePlusHooks.isEntityInLeaves(living, world)) {
+            targetMultiplier = FoliagePlusConfig.speedMultiplier;
         }
 
-        applySpeedModifier(living, FoliagePlusConfig.speedMultiplier);
+        updateSpeedModifierSmooth(living, targetMultiplier);
     }
 
     @SubscribeEvent
@@ -85,32 +86,66 @@ public class FoliagePlusTickHandler {
         }
     }
 
+    private void updateSpeedModifierSmooth(EntityLivingBase living, double targetMultiplier) {
+        IAttributeInstance attr = living.getEntityAttribute(SharedMonsterAttributes.movementSpeed);
+        if (attr == null) {
+            return;
+        }
+
+        if (targetMultiplier < 0.01D) targetMultiplier = 0.01D;
+        if (targetMultiplier > 1.00D) targetMultiplier = 1.00D;
+
+        UUID id = living.getUniqueID();
+        Double currentObj = currentSpeedMultipliers.get(id);
+        double currentMultiplier = currentObj != null ? currentObj.doubleValue() : getCurrentMultiplier(attr);
+
+        if (Math.abs(currentMultiplier - targetMultiplier) <= SPEED_SMOOTH_STEP) {
+            currentMultiplier = targetMultiplier;
+        } else if (currentMultiplier < targetMultiplier) {
+            currentMultiplier += SPEED_SMOOTH_STEP;
+        } else {
+            currentMultiplier -= SPEED_SMOOTH_STEP;
+        }
+
+        if (currentMultiplier >= 0.999D && targetMultiplier >= 0.999D) {
+            removeSpeedModifier(living);
+            currentSpeedMultipliers.remove(id);
+            return;
+        }
+
+        applySpeedModifier(living, currentMultiplier);
+        currentSpeedMultipliers.put(id, currentMultiplier);
+    }
+
+    private double getCurrentMultiplier(IAttributeInstance attr) {
+        AttributeModifier existing = attr.getModifier(SPEED_MOD_UUID);
+        if (existing == null) {
+            return 1.0D;
+        }
+        return 1.0D + existing.getAmount();
+    }
+
     private void applySpeedModifier(EntityLivingBase living, double multiplier) {
         IAttributeInstance attr = living.getEntityAttribute(SharedMonsterAttributes.movementSpeed);
         if (attr == null) {
             return;
         }
 
-        // Clamp 0.01 - 1.00
         if (multiplier < 0.01D) multiplier = 0.01D;
         if (multiplier > 1.00D) multiplier = 1.00D;
 
         AttributeModifier existing = attr.getModifier(SPEED_MOD_UUID);
+        double amount = multiplier - 1.0D;
 
-        // If multiplier is basically normal speed, remove modifier
-        if (multiplier >= 0.999D) {
-            if (existing != null) {
-                attr.removeModifier(existing);
-            }
-            return;
-        }
-
-        double amount = multiplier - 1.0D; // negative value, operation 2 => multiplicative
         if (existing != null) {
             if (Math.abs(existing.getAmount() - amount) < 0.000001D) {
-                return; // already correct
+                return;
             }
             attr.removeModifier(existing);
+        }
+
+        if (multiplier >= 0.999D) {
+            return;
         }
 
         AttributeModifier mod = new AttributeModifier(SPEED_MOD_UUID, SPEED_MOD_NAME, amount, 2);
@@ -123,6 +158,7 @@ public class FoliagePlusTickHandler {
         if (attr == null) {
             return;
         }
+
         AttributeModifier existing = attr.getModifier(SPEED_MOD_UUID);
         if (existing != null) {
             attr.removeModifier(existing);

@@ -3,6 +3,7 @@ package com.wdg.foliageplus.core;
 import net.minecraft.block.Block;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.MathHelper;
 import net.minecraft.world.World;
 
@@ -59,22 +60,44 @@ public final class FoliagePlusHooks {
     }
 
     public static boolean isEntityInLeaves(Entity entity, World world) {
-        if (entity == null || world == null) {
+        if (entity == null || world == null || entity.boundingBox == null) {
             return false;
         }
 
-        int x = MathHelper.floor_double(entity.posX);
-        int z = MathHelper.floor_double(entity.posZ);
+        AxisAlignedBB entityBox = entity.boundingBox.copy().contract(0.001D, 0.001D, 0.001D);
 
-        int yFeet = MathHelper.floor_double(entity.boundingBox.minY + 0.01D);
-        int yHead = yFeet + 1;
+        int minX = MathHelper.floor_double(entityBox.minX);
+        int maxX = MathHelper.floor_double(entityBox.maxX);
+        int minY = MathHelper.floor_double(entityBox.minY);
+        int maxY = MathHelper.floor_double(entityBox.maxY);
+        int minZ = MathHelper.floor_double(entityBox.minZ);
+        int maxZ = MathHelper.floor_double(entityBox.maxZ);
 
-        Block feet = world.getBlock(x, yFeet, z);
-        Block head = world.getBlock(x, yHead, z);
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    Block block = world.getBlock(x, y, z);
 
-        boolean inFeet = (feet != null) && feet.isLeaves(world, x, yFeet, z);
-        boolean inHead = (head != null) && head.isLeaves(world, x, yHead, z);
+                    if (block == null || !block.isLeaves(world, x, y, z)) {
+                        continue;
+                    }
 
-        return inFeet || inHead;
+                    AxisAlignedBB blockBox = AxisAlignedBB.getBoundingBox(
+                            x + block.getBlockBoundsMinX(),
+                            y + block.getBlockBoundsMinY(),
+                            z + block.getBlockBoundsMinZ(),
+                            x + block.getBlockBoundsMaxX(),
+                            y + block.getBlockBoundsMaxY(),
+                            z + block.getBlockBoundsMaxZ()
+                    );
+
+                    if (blockBox != null && entityBox.intersectsWith(blockBox)) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 }
