@@ -1,0 +1,10 @@
+// Source-only, dependency-free runner for the legacy ForgeGradle project.
+allprojects {
+    afterEvaluate {
+        task foliageRegression(type: JavaExec, dependsOn: testClasses) {
+            classpath = sourceSets.test.runtimeClasspath
+            main = 'com.wdg.foliageplus.RegressionAssertions'
+        }
+        test.dependsOn foliageRegression
+    }
+}

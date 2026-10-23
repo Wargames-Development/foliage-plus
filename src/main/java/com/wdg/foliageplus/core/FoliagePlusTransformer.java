@@ -13,6 +13,11 @@ public class FoliagePlusTransformer implements IClassTransformer {
     // - Obf:   aji
     private static final String TARGET_CLASS_DEOBF = "net.minecraft.block.Block";
     private static final String TARGET_CLASS_OBF = "aji";
+    private static final String WORLD_DEOBF = "net.minecraft.world.World";
+    private static final String WORLD_OBF = "ahb";
+    private static final String COLLISION_DESC =
+            "(Lnet/minecraft/world/World;IIILnet/minecraft/util/AxisAlignedBB;Ljava/util/List;Lnet/minecraft/entity/Entity;)V";
+    private static final String COLLISION_DESC_OBF = "(Lahb;IIILazt;Ljava/util/List;Lsa;)V";
 
     // Use Object-based hook signature so this works regardless of deobf stage
     private static final String HOOK_OWNER = "com/wdg/foliageplus/core/FoliagePlusHooks";
@@ -26,9 +31,9 @@ public class FoliagePlusTransformer implements IClassTransformer {
             return null;
         }
 
-        // Match either pre-deobf (obf) or post-deobf (deobf)
-        if (!TARGET_CLASS_DEOBF.equals(transformedName) && !TARGET_CLASS_OBF.equals(transformedName)
-                && !TARGET_CLASS_DEOBF.equals(name) && !TARGET_CLASS_OBF.equals(name)) {
+        boolean blockClass = matches(name, transformedName, TARGET_CLASS_DEOBF, TARGET_CLASS_OBF);
+        boolean worldClass = matches(name, transformedName, WORLD_DEOBF, WORLD_OBF);
+        if (!blockClass && !worldClass) {
             return basicClass;
         }
 
@@ -40,26 +45,60 @@ public class FoliagePlusTransformer implements IClassTransformer {
             boolean patched = false;
 
             for (MethodNode mn : cn.methods) {
-                if (isAddCollisionBoxesToListLike(mn)) {
+                if (blockClass && isAddCollisionBoxesToListLike(mn)) {
                     patched = injectEarlyReturn(mn) || patched;
+                } else if (worldClass && isEntityCollisionQuery(mn)) {
+                    patched = guardCollisionCalls(mn) || patched;
                 }
             }
 
             if (!patched) {
-                System.out.println("[FoliagePlus] Transformer found Block but did not patch (method signature mismatch). name=" + name + " transformed=" + transformedName);
+                System.out.println("[FoliagePlus] No new collision hook installed (already patched or signature mismatch). name=" + name + " transformed=" + transformedName);
                 return basicClass;
             }
 
-            System.out.println("[FoliagePlus] Patched Block collision method. name=" + name + " transformed=" + transformedName);
+            System.out.println("[FoliagePlus] Patched collision hook. name=" + name + " transformed=" + transformedName);
 
-            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
+            // The World rewrite preserves the exact operand stack and control
+            // flow. Keep other coremods' frames instead of loading game classes
+            // recursively while ASM tries to resolve their common superclass.
+            ClassWriter cw = new ClassWriter(worldClass ? 0 : ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
             cn.accept(cw);
             return cw.toByteArray();
         } catch (Throwable t) {
-            System.out.println("[FoliagePlus] Transformer error while patching Block: " + t);
+            System.out.println("[FoliagePlus] Transformer error while patching " + transformedName + ": " + t);
             t.printStackTrace();
             return basicClass;
         }
+    }
+
+    private boolean matches(String name, String transformedName, String deobf, String obf) {
+        return deobf.equals(name) || deobf.equals(transformedName) || obf.equals(name) || obf.equals(transformedName);
+    }
+
+    private boolean isEntityCollisionQuery(MethodNode method) {
+        return ("getCollidingBoundingBoxes".equals(method.name) || "func_72945_a".equals(method.name)
+                || "a".equals(method.name))
+                && ("(Lnet/minecraft/entity/Entity;Lnet/minecraft/util/AxisAlignedBB;)Ljava/util/List;".equals(method.desc)
+                || "(Lsa;Lazt;)Ljava/util/List;".equals(method.desc));
+    }
+
+    private boolean guardCollisionCalls(MethodNode method) {
+        boolean patched = false;
+        for (AbstractInsnNode node = method.instructions.getFirst(); node != null; node = node.getNext()) {
+            if (!(node instanceof MethodInsnNode)) continue;
+            MethodInsnNode call = (MethodInsnNode) node;
+            if (call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !("net/minecraft/block/Block".equals(call.owner) || "aji".equals(call.owner))
+                    || !isCollisionSignature(call.name, call.desc)) continue;
+            call.setOpcode(Opcodes.INVOKESTATIC);
+            call.owner = HOOK_OWNER;
+            call.name = "addCollisionBoxes";
+            call.desc = "(Ljava/lang/Object;Ljava/lang/Object;IIILjava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V";
+            call.itf = false;
+            patched = true;
+        }
+        return patched;
     }
 
     private boolean isAddCollisionBoxesToListLike(MethodNode mn) {
@@ -67,65 +106,24 @@ public class FoliagePlusTransformer implements IClassTransformer {
             return false;
         }
 
-        // Names:
-        // - MCP: addCollisionBoxesToList
-        // - SRG: func_149743_a
-        // - OBF: a   (common in 1.7.10)
-        boolean nameMatch = "addCollisionBoxesToList".equals(mn.name)
-                || "func_149743_a".equals(mn.name)
-                || "a".equals(mn.name);
-
-        if (!nameMatch) {
-            return false;
-        }
-
-        // Descriptor can be deobf or obf. Instead of exact string match, validate shape:
-        // (World, int, int, int, AABB, List, Entity) -> void
-        String d = mn.desc;
-        if (d == null || !d.endsWith(")V")) {
-            return false;
-        }
-
-        // Must include:
-        // - three ints "III"
-        // - a List
-        // - 3 object refs + List + Entity-ish
-        if (!d.contains("III") || !d.contains("Ljava/util/List;")) {
-            return false;
-        }
-
-        // Must have 7 args total; quick heuristic: count parameter separators by parsing
-        // We'll accept both:
-        // Deobf: (Lnet/minecraft/world/World;IIILnet/minecraft/util/AxisAlignedBB;Ljava/util/List;Lnet/minecraft/entity/Entity;)V
-        // Obf:   (Lahb;IIILazt;Ljava/util/List;Lsa;)V
-        int args = countArgs(d);
-        return args == 7;
+        return (mn.access & (Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) == 0
+                && isCollisionSignature(mn.name, mn.desc);
     }
 
-    private int countArgs(String desc) {
-        int i = desc.indexOf('(') + 1;
-        int end = desc.indexOf(')');
-        int count = 0;
-        while (i > 0 && i < end) {
-            char c = desc.charAt(i);
-            if (c == 'L') {
-                int semi = desc.indexOf(';', i);
-                if (semi < 0 || semi > end) break;
-                count++;
-                i = semi + 1;
-            } else if (c == '[') {
-                // skip arrays
-                i++;
-            } else {
-                // primitives: I, Z, D, F, J, B, S, C
-                count++;
-                i++;
-            }
-        }
-        return count;
+    private boolean isCollisionSignature(String name, String descriptor) {
+        return ("addCollisionBoxesToList".equals(name) || "func_149743_a".equals(name) || "a".equals(name))
+                && (COLLISION_DESC.equals(descriptor) || COLLISION_DESC_OBF.equals(descriptor));
     }
 
     private boolean injectEarlyReturn(MethodNode mn) {
+        for (AbstractInsnNode node = mn.instructions.getFirst(); node != null; node = node.getNext()) {
+            if (node instanceof MethodInsnNode) {
+                MethodInsnNode call = (MethodInsnNode) node;
+                if (HOOK_OWNER.equals(call.owner) && HOOK_NAME.equals(call.name) && HOOK_DESC.equals(call.desc)) {
+                    return false;
+                }
+            }
+        }
         InsnList insn = new InsnList();
 
         // if (FoliagePlusHooks.shouldSkipCollision(this, world, x, y, z, entity)) return;

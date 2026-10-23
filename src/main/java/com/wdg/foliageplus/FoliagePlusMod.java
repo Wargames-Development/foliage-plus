@@ -38,5 +38,6 @@ public class FoliagePlusMod {
         FoliagePlusTickHandler handler = new FoliagePlusTickHandler();
         FMLCommonHandler.instance().bus().register(handler);
         MinecraftForge.EVENT_BUS.register(handler);
+        FMLCommonHandler.instance().bus().register(new FoliagePlusNetwork());
     }
 }

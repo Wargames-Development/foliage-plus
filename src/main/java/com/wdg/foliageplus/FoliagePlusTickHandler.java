@@ -3,18 +3,23 @@ package com.wdg.foliageplus;
 import com.wdg.foliageplus.core.FoliagePlusConfig;
 import com.wdg.foliageplus.core.FoliagePlusHooks;
 import cpw.mods.fml.common.eventhandler.SubscribeEvent;
+import cpw.mods.fml.common.gameevent.PlayerEvent;
 import cpw.mods.fml.common.gameevent.TickEvent;
-import net.minecraft.entity.player.EntityPlayer;
+import cpw.mods.fml.relauncher.Side;
 import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.SharedMonsterAttributes;
 import net.minecraft.entity.ai.attributes.AttributeModifier;
 import net.minecraft.entity.ai.attributes.IAttributeInstance;
-import net.minecraft.entity.SharedMonsterAttributes;
+import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.world.World;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.event.entity.living.LivingEvent;
+import net.minecraftforge.event.world.WorldEvent;
 
-import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.UUID;
+import java.util.WeakHashMap;
 
 public class FoliagePlusTickHandler {
 
@@ -22,9 +27,16 @@ public class FoliagePlusTickHandler {
     private static final String SPEED_MOD_NAME = "FoliagePlusSlow";
 
     private static final double SPEED_SMOOTH_STEP = 0.06D;
+    private static final double SOUND_MOVEMENT_THRESHOLD_SQUARED = 0.0008D;
 
-    private final Map<UUID, Integer> clientSoundCooldown = new HashMap<UUID, Integer>();
-    private final Map<UUID, Double> currentSpeedMultipliers = new HashMap<UUID, Double>();
+    /**
+     * All maps are server-only and entity-identity keyed. Weak keys prevent
+     * replaced/dead entities from being retained if an external removal path is
+     * missed, and client/server player copies can never share one UUID entry.
+     */
+    private final Map<EntityPlayer, Integer> serverSoundCooldown = new WeakHashMap<EntityPlayer, Integer>();
+    private final Map<EntityPlayer, PlayerPosition> serverPlayerPositions = new WeakHashMap<EntityPlayer, PlayerPosition>();
+    private final Map<EntityLivingBase, Double> currentSpeedMultipliers = new WeakHashMap<EntityLivingBase, Double>();
 
     @SubscribeEvent
     public void onLivingUpdate(LivingEvent.LivingUpdateEvent event) {
@@ -34,70 +46,192 @@ public class FoliagePlusTickHandler {
 
         EntityLivingBase living = event.entityLiving;
         World world = living.worldObj;
-        if (world == null) {
+        if (world == null || world.isRemote) {
             return;
         }
 
-        if (!FoliagePlusConfig.enabled) {
-            updateSpeedModifierSmooth(living, 1.0D);
+        // Players are evaluated after their movement at PlayerTick END. Running
+        // both paths would smooth twice and diagnose a different contact sample.
+        if (living instanceof EntityPlayer) {
             return;
         }
 
-        boolean isPlayer = (living instanceof EntityPlayer);
-
-        if (!FoliagePlusConfig.affectAllEntities && !isPlayer) {
-            updateSpeedModifierSmooth(living, 1.0D);
+        FoliagePlusConfig.Settings settings = FoliagePlusConfig.getSettings(world);
+        if (!settings.enabled) {
+            clearSpeedState(living);
+            FoliagePlusHooks.clearDebugState(living);
             return;
         }
 
-        if (isPlayer) {
-            EntityPlayer player = (EntityPlayer) living;
-            if (player.capabilities.isFlying) {
-                updateSpeedModifierSmooth(living, 1.0D);
-                return;
-            }
+        if (!settings.affectAllEntities) {
+            clearSpeedState(living);
+            FoliagePlusHooks.clearDebugState(living);
+            return;
         }
 
-        double targetMultiplier = 1.0D;
-
-        if (FoliagePlusHooks.isEntityInLeaves(living, world)) {
-            targetMultiplier = FoliagePlusConfig.speedMultiplier;
+        if (living.isDead || living.getHealth() <= 0.0F) {
+            clearEntityState(living);
+            return;
         }
+
+        if (living.noClip || living.ridingEntity != null) {
+            clearSpeedState(living);
+            return;
+        }
+
+        boolean inLeaves = FoliagePlusHooks.isEntityInLeaves(living, world);
+        double targetMultiplier = inLeaves ? settings.speedMultiplier : 1.0D;
 
         updateSpeedModifierSmooth(living, targetMultiplier);
+
+        FoliagePlusHooks.recordContactTransition(
+                    living,
+                    world,
+                    inLeaves,
+                    isMovingHorizontally(living),
+                    hasSpeedModifier(living),
+                    false);
     }
 
     @SubscribeEvent
     public void onPlayerTick(TickEvent.PlayerTickEvent event) {
-        if (event.phase != TickEvent.Phase.END) {
+        if (event.phase != TickEvent.Phase.END || event.side != Side.SERVER || event.player == null) {
             return;
         }
 
-        final EntityPlayer player = event.player;
-        final World world = player.worldObj;
-
-        if (!FoliagePlusConfig.enabled) {
+        EntityPlayer player = event.player;
+        World world = player.worldObj;
+        if (world == null || world.isRemote) {
             return;
         }
 
-        // Client-only: play a vanilla rustle sound while moving through leaves
-        if (world.isRemote) {
-            handleClientSound(player);
+        FoliagePlusConfig.Settings settings = FoliagePlusConfig.getSettings(world);
+        if (!settings.enabled || player.isDead || player.getHealth() <= 0.0F) {
+            clearEntityState(player);
+            return;
         }
+
+        boolean inLeaves = FoliagePlusHooks.isEntityInLeaves(player, world);
+        if (player.capabilities.isFlying || player.noClip || player.ridingEntity != null) {
+            clearSpeedState(player);
+        } else {
+            updateSpeedModifierSmooth(player, inLeaves ? settings.speedMultiplier : 1.0D);
+        }
+        boolean moving = updateAndCheckServerMovement(player);
+        boolean soundPlayed = false;
+
+        if (!inLeaves || !moving || player.noClip || player.ridingEntity != null) {
+            // A new genuine movement/contact episode should be able to rustle
+            // immediately rather than inheriting stale cooldown state.
+            serverSoundCooldown.remove(player);
+        } else {
+            Integer cooldown = serverSoundCooldown.get(player);
+            int remaining = cooldown == null ? 0 : cooldown.intValue();
+
+            if (remaining > 0) {
+                serverSoundCooldown.put(player, Integer.valueOf(remaining - 1));
+            } else {
+                float pitch = 0.9F + (world.rand.nextFloat() * 0.2F);
+                double soundX = player.posX + (world.rand.nextDouble() - 0.5D) * 0.6D;
+                double soundZ = player.posZ + (world.rand.nextDouble() - 0.5D) * 0.6D;
+
+                // Server-side playSoundEffect broadcasts exactly one positioned
+                // rustle to nearby clients, preserving remote-player audibility
+                // without every client independently ticking remote players.
+                world.playSoundEffect(soundX, player.posY + 1.0D, soundZ,
+                        "foliageplus:rustle", 8.0F, pitch);
+                serverSoundCooldown.put(player, Integer.valueOf(2 + world.rand.nextInt(2)));
+                soundPlayed = true;
+            }
+        }
+
+        FoliagePlusHooks.recordContactTransition(
+                player,
+                world,
+                inLeaves,
+                moving,
+                hasSpeedModifier(player),
+                soundPlayed);
+    }
+
+    @SubscribeEvent
+    public void onLivingDeath(LivingDeathEvent event) {
+        if (event.entityLiving == null) {
+            return;
+        }
+
+        World world = event.entityLiving.worldObj;
+        if (world != null && world.isRemote) {
+            FoliagePlusHooks.clearDebugState(event.entityLiving);
+            return;
+        }
+
+        clearEntityState(event.entityLiving);
+    }
+
+    @SubscribeEvent
+    public void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        clearPlayerState(event.player);
+    }
+
+    @SubscribeEvent
+    public void onPlayerRespawn(PlayerEvent.PlayerRespawnEvent event) {
+        clearPlayerState(event.player);
+    }
+
+    @SubscribeEvent
+    public void onPlayerChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
+        clearPlayerState(event.player);
+    }
+
+    @SubscribeEvent
+    public void onWorldUnload(WorldEvent.Unload event) {
+        World world = event.world;
+        FoliagePlusHooks.clearDebugState(world);
+
+        if (world == null || world.isRemote) {
+            return;
+        }
+
+        Iterator<Map.Entry<EntityLivingBase, Double>> speedIterator = currentSpeedMultipliers.entrySet().iterator();
+        while (speedIterator.hasNext()) {
+            EntityLivingBase living = speedIterator.next().getKey();
+            if (living == null || living.worldObj == world) {
+                if (living != null) {
+                    removeSpeedModifier(living);
+                }
+                speedIterator.remove();
+            }
+        }
+
+        removePlayersFromWorld(serverSoundCooldown, world);
+        removePlayersFromWorld(serverPlayerPositions, world);
     }
 
     private void updateSpeedModifierSmooth(EntityLivingBase living, double targetMultiplier) {
         IAttributeInstance attr = living.getEntityAttribute(SharedMonsterAttributes.movementSpeed);
         if (attr == null) {
+            currentSpeedMultipliers.remove(living);
             return;
         }
 
+        // Never retain a foliage penalty after contact ends, including teleports
+        // and block removal. Smooth entry only; the old exit ramp lasted up to
+        // 17 ticks and felt like random slowdown well away from the leaves.
+        if (Double.isNaN(targetMultiplier) || Double.isInfinite(targetMultiplier) || targetMultiplier >= 0.999D) {
+            clearSpeedState(living);
+            return;
+        }
         if (targetMultiplier < 0.01D) targetMultiplier = 0.01D;
-        if (targetMultiplier > 1.00D) targetMultiplier = 1.00D;
 
-        UUID id = living.getUniqueID();
-        Double currentObj = currentSpeedMultipliers.get(id);
-        double currentMultiplier = currentObj != null ? currentObj.doubleValue() : getCurrentMultiplier(attr);
+        Double currentObject = currentSpeedMultipliers.get(living);
+
+        double currentMultiplier = currentObject != null
+                ? currentObject.doubleValue()
+                : getCurrentMultiplier(attr);
+        if (Double.isNaN(currentMultiplier) || Double.isInfinite(currentMultiplier)) {
+            currentMultiplier = 1.0D;
+        }
 
         if (Math.abs(currentMultiplier - targetMultiplier) <= SPEED_SMOOTH_STEP) {
             currentMultiplier = targetMultiplier;
@@ -107,19 +241,13 @@ public class FoliagePlusTickHandler {
             currentMultiplier -= SPEED_SMOOTH_STEP;
         }
 
-        if (currentMultiplier >= 0.999D && targetMultiplier >= 0.999D) {
-            removeSpeedModifier(living);
-            currentSpeedMultipliers.remove(id);
-            return;
-        }
-
         applySpeedModifier(living, currentMultiplier);
-        currentSpeedMultipliers.put(id, currentMultiplier);
+        currentSpeedMultipliers.put(living, Double.valueOf(currentMultiplier));
     }
 
     private double getCurrentMultiplier(IAttributeInstance attr) {
         AttributeModifier existing = attr.getModifier(SPEED_MOD_UUID);
-        if (existing == null) {
+        if (existing == null || existing.getOperation() != 2) {
             return 1.0D;
         }
         return 1.0D + existing.getAmount();
@@ -138,7 +266,8 @@ public class FoliagePlusTickHandler {
         double amount = multiplier - 1.0D;
 
         if (existing != null) {
-            if (Math.abs(existing.getAmount() - amount) < 0.000001D) {
+            if (existing.getOperation() == 2 && !existing.isSaved()
+                    && Math.abs(existing.getAmount() - amount) < 0.000001D) {
                 return;
             }
             attr.removeModifier(existing);
@@ -148,9 +277,46 @@ public class FoliagePlusTickHandler {
             return;
         }
 
-        AttributeModifier mod = new AttributeModifier(SPEED_MOD_UUID, SPEED_MOD_NAME, amount, 2);
-        mod.setSaved(false);
-        attr.applyModifier(mod);
+        AttributeModifier modifier = new AttributeModifier(SPEED_MOD_UUID, SPEED_MOD_NAME, amount, 2);
+        modifier.setSaved(false);
+        attr.applyModifier(modifier);
+    }
+
+    private boolean hasSpeedModifier(EntityLivingBase living) {
+        IAttributeInstance attr = living.getEntityAttribute(SharedMonsterAttributes.movementSpeed);
+        return attr != null && attr.getModifier(SPEED_MOD_UUID) != null;
+    }
+
+    private void clearSpeedState(EntityLivingBase living) {
+        currentSpeedMultipliers.remove(living);
+        removeSpeedModifier(living);
+    }
+
+    private void clearPlayerState(EntityPlayer player) {
+        if (player == null) {
+            return;
+        }
+
+        World world = player.worldObj;
+        if (world != null && world.isRemote) {
+            FoliagePlusHooks.clearDebugState(player);
+            return;
+        }
+
+        clearEntityState(player);
+    }
+
+    private void clearEntityState(EntityLivingBase living) {
+        if (living == null) {
+            return;
+        }
+        clearSpeedState(living);
+        if (living instanceof EntityPlayer) {
+            EntityPlayer player = (EntityPlayer) living;
+            serverSoundCooldown.remove(player);
+            serverPlayerPositions.remove(player);
+        }
+        FoliagePlusHooks.clearDebugState(living);
     }
 
     private void removeSpeedModifier(EntityLivingBase living) {
@@ -165,38 +331,45 @@ public class FoliagePlusTickHandler {
         }
     }
 
-    private void handleClientSound(EntityPlayer player) {
-        if (!FoliagePlusHooks.isEntityInLeaves(player, player.worldObj)) {
-            return;
+    private boolean updateAndCheckServerMovement(EntityPlayer player) {
+        PlayerPosition previous = serverPlayerPositions.get(player);
+        if (previous == null || previous.world != player.worldObj) {
+            serverPlayerPositions.put(player, new PlayerPosition(player.worldObj, player.posX, player.posZ));
+            return false;
         }
 
-        // Only play when actually moving
-        final double speed2 = (player.motionX * player.motionX) + (player.motionZ * player.motionZ);
-        if (speed2 < 0.0008D) {
-            return;
+        double deltaX = player.posX - previous.x;
+        double deltaZ = player.posZ - previous.z;
+        previous.x = player.posX;
+        previous.z = player.posZ;
+
+        return (deltaX * deltaX) + (deltaZ * deltaZ) >= SOUND_MOVEMENT_THRESHOLD_SQUARED;
+    }
+
+    private boolean isMovingHorizontally(EntityLivingBase living) {
+        double speedSquared = (living.motionX * living.motionX) + (living.motionZ * living.motionZ);
+        return speedSquared >= SOUND_MOVEMENT_THRESHOLD_SQUARED;
+    }
+
+    private <T> void removePlayersFromWorld(Map<EntityPlayer, T> map, World world) {
+        Iterator<EntityPlayer> iterator = map.keySet().iterator();
+        while (iterator.hasNext()) {
+            EntityPlayer player = iterator.next();
+            if (player == null || player.worldObj == world) {
+                iterator.remove();
+            }
         }
+    }
 
-        UUID id = player.getUniqueID();
-        int cd = clientSoundCooldown.containsKey(id) ? clientSoundCooldown.get(id) : 0;
+    private static final class PlayerPosition {
+        private final World world;
+        private double x;
+        private double z;
 
-        if (cd > 0) {
-            clientSoundCooldown.put(id, cd - 1);
-            return;
+        private PlayerPosition(World world, double x, double z) {
+            this.world = world;
+            this.x = x;
+            this.z = z;
         }
-
-        // Rustle sound: use World.playSound with distanceDelay=false (most reliable client path in 1.7.10)
-        float pitch = 0.9F + (player.worldObj.rand.nextFloat() * 0.2F);
-        // Play slightly above the player to reduce hard L/R panning artifacts while strafing
-        double jx = player.posX + (player.worldObj.rand.nextDouble() - 0.5D) * 0.6D;
-        double jz = player.posZ + (player.worldObj.rand.nextDouble() - 0.5D) * 0.6D;
-        player.worldObj.playSound(player.posX, player.posY + 1.0D, player.posZ, "foliageplus:rustle", 8.0F, pitch, false);
-
-        // Fallback (temporary): if you still hear nothing, this SHOULD be audible.
-        // Remove once confirmed.
-        //player.worldObj.playSound(player.posX, player.posY, player.posZ, "random.orb", 1.0F, 1.0F, false);
-
-
-        // Shorter cooldown: makes it feel like consistent rustling while moving
-        clientSoundCooldown.put(id, 2 + player.worldObj.rand.nextInt(2));
     }
 }
